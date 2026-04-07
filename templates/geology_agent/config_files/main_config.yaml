@@ -1,0 +1,10 @@
+name: Geology_Main_Agent
+system_prompt_key: MAIN_PROMPT
+workspace_path: workspace
+tools:
+  - preview_dataset
+  - send_files_to_user
+prompts:
+  MAIN_PROMPT: main_prompt.md
+  PROMPT_COMPOSITACION: prompt_compositacion.md
+  PROMPT_NEAREST_NEIGHBOR_ASSIGNMENT: prompt_nearest_neighbor_assignment.md
