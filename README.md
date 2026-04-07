@@ -169,6 +169,14 @@ They are deliberately lightweight so the repo can be demoed quickly without need
 uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
+6. In a separate terminal, start the Streamlit demo client:
+
+```bash
+uv run streamlit run streamlit_app.py
+```
+
+The Streamlit frontend is built for demos and interviews. It supports user registration, file upload, chat streaming, artifact rendering, and interrupt visibility. It currently shows interrupts but does not resume them, because the backend does not expose a resume endpoint yet.
+
 ## Why this project matters for AI engineering roles
 
 This project is meant to show more than API construction. It is evidence of how I think about agent systems as software systems:
