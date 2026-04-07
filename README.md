@@ -177,14 +177,3 @@ uv run streamlit run streamlit_app.py
 
 The Streamlit frontend is built for demos and interviews. It supports user registration, file upload, chat streaming, artifact rendering, and interrupt visibility. It currently shows interrupts but does not resume them, because the backend does not expose a resume endpoint yet.
 
-## Why this project matters for AI engineering roles
-
-This project is meant to show more than API construction. It is evidence of how I think about agent systems as software systems:
-
-- when to use specialists instead of a single agent
-- when to require tools instead of trusting text-only reasoning
-- where to place human approval boundaries
-- how to manage context, state, and artifacts across multi-step workflows
-- how to design a backend that is easy to repurpose for a new vertical without rewriting the orchestration model
-
-That makes it a useful portfolio project for discussions about agent architecture, workflow reliability, context management, and production-oriented design tradeoffs.
