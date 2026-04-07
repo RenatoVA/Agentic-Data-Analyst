@@ -1,0 +1,13 @@
+order_id,region,channel,revenue,units,discount_pct,customer_tier,satisfaction_score
+1001,North,Online,12500,42,0.05,Gold,4.8
+1002,North,Retail,8400,31,0.08,Silver,4.1
+1003,South,Partner,15600,55,0.12,Gold,4.5
+1004,East,Online,5400,18,0.02,Bronze,3.9
+1005,West,Retail,11200,39,0.07,Silver,4.2
+1006,South,Online,9800,34,0.03,Gold,4.7
+1007,East,Partner,6200,21,0.15,Bronze,3.6
+1008,West,Online,17300,61,0.04,Gold,4.9
+1009,North,Partner,7600,28,0.10,Silver,4.0
+1010,South,Retail,13400,47,0.06,Gold,4.4
+1011,East,Online,6900,24,0.05,Silver,4.1
+1012,West,Partner,8900,29,0.09,Bronze,3.8

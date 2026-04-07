@@ -1,0 +1,13 @@
+lead_id,source,industry,engagement_score,company_size,days_to_contact,estimated_deal_k,won
+L-001,LinkedIn,SaaS,88,220,1,95,yes
+L-002,Webinar,Fintech,74,140,3,65,no
+L-003,Referral,Healthcare,92,310,1,120,yes
+L-004,Organic,SaaS,61,45,5,28,no
+L-005,LinkedIn,Retail,55,80,6,34,no
+L-006,Referral,Manufacturing,81,260,2,87,yes
+L-007,Webinar,Healthcare,69,125,4,52,no
+L-008,Organic,Fintech,58,70,7,31,no
+L-009,Referral,SaaS,95,410,1,150,yes
+L-010,LinkedIn,Manufacturing,77,180,2,73,yes
+L-011,Webinar,Retail,63,95,5,39,no
+L-012,Organic,Healthcare,71,160,3,58,yes

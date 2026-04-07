@@ -1,7 +1,7 @@
 [project]
-name = "agentic-yupai"
+name = "agentic-data-analyst"
 version = "0.1.0"
-description = "Add your description here"
+description = "Agentic backend for dataset analysis, profiling, visualization, and segmentation."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

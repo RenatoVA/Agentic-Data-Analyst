@@ -16,9 +16,9 @@ def create_app() -> FastAPI:
     ensure_directory(settings.USERS_DIR)
 
     app = FastAPI(
-        title="Agentic YupAI API",
+        title="Agentic Data Analyst API",
         version="0.1.0",
-        description="Agents-as-a-Service backend with dynamic YAML-configured DeepAgents.",
+        description="Agentic analytics backend with YAML-configured specialists, streaming, tools, and human approvals.",
     )
 
     origins = settings.cors_origins

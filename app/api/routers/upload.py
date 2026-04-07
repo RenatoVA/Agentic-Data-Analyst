@@ -9,7 +9,21 @@ from app.core.config import Settings
 from app.schemas.upload import UploadResponse
 from app.utils.files import ensure_directory, sanitize_filename
 
-ALLOWED_EXTENSIONS = {".csv", ".xlsx", ".xls",".png", ".jpg", ".jpeg", ".gif",".md",".txt", ".pdf", ".docx", ".pptx"}
+ALLOWED_EXTENSIONS = {
+    ".csv",
+    ".xlsx",
+    ".xls",
+    ".json",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".md",
+    ".txt",
+    ".pdf",
+    ".docx",
+    ".pptx",
+}
 
 router = APIRouter()
 
@@ -28,7 +42,10 @@ async def upload_file(
     safe_name = sanitize_filename(file.filename)
     extension = Path(safe_name).suffix.lower()
     if extension not in ALLOWED_EXTENSIONS:
-        raise HTTPException(status_code=415, detail="Only CSV and Excel uploads are allowed.")
+        raise HTTPException(
+            status_code=415,
+            detail="Only CSV, Excel, JSON, image, markdown, text, and office document uploads are allowed.",
+        )
 
     user_upload_dir = settings.USERS_DIR / registered_user_id / "workspace"
     ensure_directory(user_upload_dir)

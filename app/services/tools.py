@@ -2,19 +2,22 @@ from __future__ import annotations
 
 import ast
 import io
+import json
 import mimetypes
 import os
 import uuid
 from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from typing import Any
-import numpy as np
+from typing import Any, Literal
+
 import matplotlib
+import numpy as np
 import pandas as pd
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
-from sklearn.neighbors import KDTree
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
 
 from app.utils.files import ensure_directory, resolve_workspace_path
 
@@ -22,70 +25,152 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 
-
-class NearestNeighborInput(BaseModel):
-    origin_file_path: str = Field(
-        ...,
-        description="Path to the origin CSV/Excel file (relative to ROOT_DIR). Contains the source points with attributes to transfer (e.g., drillhole assays, block model grades).",
-    )
-    destination_file_path: str = Field(
-        ...,
-        description="Path to the destination CSV/Excel file (relative to ROOT_DIR). Contains the target points that will receive attributes from their nearest origin neighbor.",
-    )
-    output_file_path: str = Field(
-        ...,
-        description="Output CSV path (relative to ROOT_DIR) where the destination data with assigned attributes and distances will be saved.",
-    )
-    radius: float = Field(
-        ...,
-        description="Maximum search radius for nearest neighbor assignment. Only origin points within this distance will be matched. Units must match the coordinate system (e.g., meters).",
-    )
-    col_x: str = Field(
-        default="X",
-        description="Name of the X coordinate column in both origin and destination files. Case-insensitive.",
-    )
-    col_y: str = Field(
-        default="Y",
-        description="Name of the Y coordinate column in both origin and destination files. Case-insensitive.",
-    )
-    col_z: str = Field(
-        default="Z",
-        description="Name of the Z coordinate column in both origin and destination files. Case-insensitive.",
-    )
+def _load_tabular_data(path: Path) -> pd.DataFrame:
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        return pd.read_csv(path)
+    if suffix in {".xlsx", ".xls"}:
+        return pd.read_excel(path)
+    if suffix == ".json":
+        return pd.read_json(path)
+    raise ValueError(f"Unsupported tabular file type: {path.suffix}")
 
 
-class CompositingInput(BaseModel):
-    input_file_path: str = Field(..., description="Input Excel/CSV path relative to ROOT_DIR.")
-    output_file_path: str = Field(..., description="Output CSV path relative to ROOT_DIR.")
-    col_bhid: str = Field(..., description="Drillhole ID column.")
-    col_from: str = Field(..., description="From depth column.")
-    col_to: str = Field(..., description="To depth column.")
-    col_grade: str = Field(..., description="Grade column.")
-    col_lithology: str | None = Field(None, description="Lithology column.")
-    cutoff_grade: float = Field(..., description="Minimum cutoff grade.")
-    waste_cutoff: float = Field(..., description="Maximum waste grade.")
-    max_waste_length: float = Field(..., description="Maximum contiguous waste length.")
-    priority_ranges: list[list[float]] = Field(..., description="Grade priority ranges.")
-    exclude_lithology: str | None = Field(None, description="Lithology code to exclude from surface.")
+def _write_tabular_data(df: pd.DataFrame, path: Path) -> None:
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        df.to_csv(path, index=False)
+        return
+    if suffix in {".xlsx", ".xls"}:
+        df.to_excel(path, index=False)
+        return
+    if suffix == ".json":
+        df.to_json(path, orient="records", indent=2)
+        return
+    raise ValueError(f"Unsupported output file type: {path.suffix}")
+
+
+def _to_jsonable(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (np.integer, np.floating)):
+        return value.item()
+    if isinstance(value, (int, float)):
+        return None if pd.isna(value) else value
+    if isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, (pd.Timestamp, pd.Timedelta)):
+        return str(value)
+    if isinstance(value, np.ndarray):
+        return [_to_jsonable(item) for item in value.tolist()]
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return value
+
+
+def _frame_preview(df: pd.DataFrame, rows: int = 5) -> list[dict[str, Any]]:
+    preview_df = df.head(rows).replace({np.nan: None})
+    records: list[dict[str, Any]] = []
+    for record in preview_df.to_dict(orient="records"):
+        records.append({key: _to_jsonable(value) for key, value in record.items()})
+    return records
+
+
+def _relative_output_path(root_dir: Path, output_path: Path) -> str:
+    root_resolved = root_dir.resolve()
+    output_resolved = output_path.resolve()
+    try:
+        return str(output_resolved.relative_to(root_resolved))
+    except ValueError:
+        return str(output_resolved)
+
+
+class DatasetValidateInput(BaseModel):
+    input_file_path: str = Field(..., description="Input Excel, CSV, or JSON path.")
+    required_columns: list[str] = Field(..., description="Required dataset columns.")
+
+
+class DatasetPreviewInput(BaseModel):
+    input_file_path: str = Field(..., description="Input Excel, CSV, or JSON path.")
+    n_rows: int = Field(5, ge=1, le=100, description="Rows to preview.")
+
+
+class DatasetProfileInput(BaseModel):
+    input_file_path: str = Field(..., description="Input Excel, CSV, or JSON path.")
+    top_k_categories: int = Field(5, ge=1, le=10, description="Top values to show for categorical columns.")
+
+
+class CleanDatasetInput(BaseModel):
+    input_file_path: str = Field(..., description="Input Excel, CSV, or JSON path.")
+    output_file_path: str = Field(..., description="Output path for the cleaned dataset.")
+    numeric_columns: list[str] = Field(default_factory=list, description="Numeric columns to coerce and fill.")
+    categorical_columns: list[str] = Field(default_factory=list, description="Categorical columns to fill.")
+    drop_duplicates: bool = Field(True, description="Remove duplicate rows.")
+    drop_empty_rows: bool = Field(True, description="Remove rows that are completely empty.")
+    strip_whitespace: bool = Field(True, description="Trim whitespace on string columns.")
+    fill_numeric_strategy: Literal["none", "median", "mean", "zero"] = Field(
+        "median",
+        description="How to fill missing numeric values.",
+    )
+    fill_categorical_value: str | None = Field(
+        "Unknown",
+        description="Fill value for missing categorical values. Use null to skip categorical filling.",
+    )
+
+
+class CompareDatasetsInput(BaseModel):
+    baseline_file_path: str = Field(..., description="Reference dataset path.")
+    candidate_file_path: str = Field(..., description="Candidate dataset path to compare against the baseline.")
+    key_columns: list[str] = Field(
+        default_factory=list,
+        description="Optional key columns used to measure row overlap between both datasets.",
+    )
+
+
+class SegmentDatasetInput(BaseModel):
+    input_file_path: str = Field(..., description="Input Excel, CSV, or JSON path.")
+    output_file_path: str = Field(..., description="Output path for the segmented dataset.")
+    feature_columns: list[str] = Field(..., min_length=1, description="Numeric feature columns used for clustering.")
+    n_clusters: int = Field(3, ge=2, le=10, description="Number of KMeans clusters to create.")
+    cluster_label_column: str = Field("cluster_label", description="Name of the output cluster label column.")
+    scale_features: bool = Field(True, description="Standardize features before clustering.")
+    random_state: int = Field(42, description="Random seed used by KMeans.")
+
+
+class ReportExportInput(BaseModel):
+    output_file_path: str = Field(..., description="Output report path. Use .md for markdown or .json for JSON.")
+    report_title: str = Field(..., min_length=3, description="Human-readable report title.")
+    executive_summary: str = Field(..., min_length=10, description="Executive summary of the analysis.")
+    key_findings: list[str] = Field(..., min_length=1, description="Ordered list of the most important findings.")
+    recommended_actions: list[str] = Field(
+        default_factory=list,
+        description="Optional follow-up actions or recommendations.",
+    )
+    supporting_metrics: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Optional metrics that should appear in the report.",
+    )
+    source_file_paths: list[str] = Field(
+        default_factory=list,
+        description="Relevant workspace files referenced by the report.",
+    )
+    report_format: Literal["markdown", "json"] = Field(
+        "markdown",
+        description="Output format for the exported report.",
+    )
 
 
 class PlotInput(BaseModel):
     code: str = Field(..., description="Python code to generate a plot.")
 
 
-class DatasetValidateInput(BaseModel):
-    input_file_path: str = Field(..., description="Input Excel/CSV path.")
-    required_columns: list[str] = Field(..., description="Required dataset columns.")
-
-
-class DatasetPreviewInput(BaseModel):
-    input_file_path: str = Field(..., description="Input Excel/CSV path.")
-    n_rows: int = Field(5, ge=1, le=100, description="Rows to preview.")
-
 class SendFilesToUserInput(BaseModel):
     filename: str = Field(
         ...,
-        description="File path relative to the workspace (e.g. 'generated_plots/plot_abc.png' or 'compositos.csv').",
+        description="File path relative to the workspace (e.g. 'generated_plots/plot_abc.png' or 'analysis/report.md').",
     )
 
 
@@ -93,24 +178,16 @@ class DatasetPreviewTool:
     def __init__(self, root_dir: Path):
         self.root_dir = root_dir
 
-    @staticmethod
-    def _load_data(path: Path) -> pd.DataFrame:
-        if path.suffix.lower() == ".csv":
-            return pd.read_csv(path)
-        return pd.read_excel(path)
-
     def preview_dataset(self, input_file_path: str, n_rows: int = 5) -> dict[str, Any]:
         try:
             file_path = resolve_workspace_path(self.root_dir, input_file_path, must_exist=True)
-            df = self._load_data(file_path)
-            preview = df.head(n_rows).to_dict(orient="list")
-            dtypes = {col: str(dtype) for col, dtype in df.dtypes.items()}
+            df = _load_tabular_data(file_path)
             return {
                 "status": "success",
                 "rows": int(df.shape[0]),
                 "columns": list(df.columns),
-                "dtypes": dtypes,
-                "preview": preview,
+                "dtypes": {col: str(dtype) for col, dtype in df.dtypes.items()},
+                "preview": _frame_preview(df, rows=n_rows),
             }
         except Exception as exc:
             return {"status": "error", "error": str(exc)}
@@ -128,24 +205,18 @@ class DatasetValidateTool:
     def __init__(self, root_dir: Path):
         self.root_dir = root_dir
 
-    @staticmethod
-    def _load_data(path: Path) -> pd.DataFrame:
-        if path.suffix.lower() == ".csv":
-            return pd.read_csv(path)
-        return pd.read_excel(path)
-
     def validate_dataset(self, input_file_path: str, required_columns: list[str]) -> dict[str, Any]:
         try:
             file_path = resolve_workspace_path(self.root_dir, input_file_path, must_exist=True)
-            df = self._load_data(file_path)
+            df = _load_tabular_data(file_path)
+            available_columns = list(df.columns)
             missing = [col for col in required_columns if col not in df.columns]
-            dtypes = {col: str(dtype) for col, dtype in df.dtypes.items()}
             return {
                 "status": "success",
-                "missing_columns": missing,
-                "available_columns": list(df.columns),
-                "dtypes": dtypes,
                 "valid": len(missing) == 0,
+                "missing_columns": missing,
+                "available_columns": available_columns,
+                "dtypes": {col: str(dtype) for col, dtype in df.dtypes.items()},
             }
         except Exception as exc:
             return {"status": "error", "error": str(exc)}
@@ -154,20 +225,442 @@ class DatasetValidateTool:
         return StructuredTool.from_function(
             func=self.validate_dataset,
             name="validate_dataset",
-            description="Validate required columns in dataset.",
+            description="Validate that a dataset contains the required columns.",
             args_schema=DatasetValidateInput,
         )
+
+
+class DatasetProfileTool:
+    def __init__(self, root_dir: Path):
+        self.root_dir = root_dir
+
+    def profile_dataset(self, input_file_path: str, top_k_categories: int = 5) -> dict[str, Any]:
+        try:
+            file_path = resolve_workspace_path(self.root_dir, input_file_path, must_exist=True)
+            df = _load_tabular_data(file_path)
+
+            numeric_columns = list(df.select_dtypes(include=["number"]).columns)
+            categorical_columns = list(df.select_dtypes(exclude=["number"]).columns)
+            missing_counts = df.isna().sum().sort_values(ascending=False)
+            missing_ratio = ((missing_counts / max(len(df), 1)) * 100).round(2)
+            duplicate_rows = int(df.duplicated().sum())
+
+            numeric_summary: dict[str, Any] = {}
+            if numeric_columns:
+                describe_df = df[numeric_columns].describe().transpose().round(4).replace({np.nan: None})
+                numeric_summary = {
+                    column: {metric: _to_jsonable(value) for metric, value in metrics.items()}
+                    for column, metrics in describe_df.to_dict(orient="index").items()
+                }
+
+            categorical_summary: dict[str, Any] = {}
+            for column in categorical_columns[: min(len(categorical_columns), 8)]:
+                top_values = (
+                    df[column]
+                    .astype("string")
+                    .fillna("<MISSING>")
+                    .value_counts(dropna=False)
+                    .head(top_k_categories)
+                )
+                categorical_summary[column] = {str(key): int(value) for key, value in top_values.items()}
+
+            warnings: list[str] = []
+            high_missing = [col for col, pct in missing_ratio.items() if pct >= 30]
+            if high_missing:
+                warnings.append(f"Columns with >=30% missing values: {', '.join(high_missing[:8])}.")
+            if duplicate_rows:
+                warnings.append(f"Dataset contains {duplicate_rows} duplicate rows.")
+            constant_columns = [col for col in df.columns if df[col].nunique(dropna=False) <= 1]
+            if constant_columns:
+                warnings.append(f"Constant or near-empty columns detected: {', '.join(constant_columns[:8])}.")
+
+            return {
+                "status": "success",
+                "shape": {"rows": int(df.shape[0]), "columns": int(df.shape[1])},
+                "column_types": {
+                    "numeric": numeric_columns,
+                    "categorical": categorical_columns,
+                },
+                "missing_by_column": {
+                    column: {
+                        "missing_rows": int(missing_counts[column]),
+                        "missing_pct": _to_jsonable(missing_ratio[column]),
+                    }
+                    for column in missing_counts.index[: min(len(missing_counts), 20)]
+                    if int(missing_counts[column]) > 0
+                },
+                "duplicate_rows": duplicate_rows,
+                "numeric_summary": numeric_summary,
+                "categorical_summary": categorical_summary,
+                "warnings": warnings,
+            }
+        except Exception as exc:
+            return {"status": "error", "error": str(exc)}
+
+    def get_tool(self) -> StructuredTool:
+        return StructuredTool.from_function(
+            func=self.profile_dataset,
+            name="profile_dataset",
+            description="Profile a tabular dataset and return quality warnings, missingness, and summary stats.",
+            args_schema=DatasetProfileInput,
+        )
+
+
+class CleanDatasetTool:
+    def __init__(self, root_dir: Path):
+        self.root_dir = root_dir
+
+    def clean_dataset(
+        self,
+        input_file_path: str,
+        output_file_path: str,
+        numeric_columns: list[str] | None = None,
+        categorical_columns: list[str] | None = None,
+        drop_duplicates: bool = True,
+        drop_empty_rows: bool = True,
+        strip_whitespace: bool = True,
+        fill_numeric_strategy: Literal["none", "median", "mean", "zero"] = "median",
+        fill_categorical_value: str | None = "Unknown",
+    ) -> dict[str, Any]:
+        try:
+            input_path = resolve_workspace_path(self.root_dir, input_file_path, must_exist=True)
+            output_path = resolve_workspace_path(self.root_dir, output_file_path, must_exist=False)
+            ensure_directory(output_path.parent)
+
+            df = _load_tabular_data(input_path).copy()
+            rows_before = int(len(df))
+            nulls_before = int(df.isna().sum().sum())
+
+            if strip_whitespace:
+                string_columns = list(df.select_dtypes(include=["object", "string"]).columns)
+                for column in string_columns:
+                    df[column] = df[column].map(lambda value: value.strip() if isinstance(value, str) else value)
+
+            if drop_empty_rows:
+                df = df.dropna(how="all")
+
+            duplicates_removed = 0
+            if drop_duplicates:
+                duplicates_removed = int(df.duplicated().sum())
+                df = df.drop_duplicates()
+
+            numeric_targets = list(numeric_columns or df.select_dtypes(include=["number"]).columns)
+            for column in numeric_targets:
+                if column not in df.columns:
+                    return {"status": "error", "error": f"Numeric column '{column}' not found in dataset."}
+                df[column] = pd.to_numeric(df[column], errors="coerce")
+
+            if fill_numeric_strategy != "none":
+                for column in numeric_targets:
+                    if fill_numeric_strategy == "median":
+                        fill_value = df[column].median()
+                    elif fill_numeric_strategy == "mean":
+                        fill_value = df[column].mean()
+                    else:
+                        fill_value = 0
+
+                    if pd.isna(fill_value):
+                        fill_value = 0
+                    df[column] = df[column].fillna(fill_value)
+
+            categorical_targets = list(
+                categorical_columns
+                or df.select_dtypes(include=["object", "string", "category"]).columns
+            )
+            if fill_categorical_value is not None:
+                for column in categorical_targets:
+                    if column not in df.columns:
+                        return {"status": "error", "error": f"Categorical column '{column}' not found in dataset."}
+                    df[column] = df[column].fillna(fill_categorical_value)
+
+            _write_tabular_data(df, output_path)
+
+            return {
+                "status": "success",
+                "message": "Dataset cleaned successfully.",
+                "input_rows": rows_before,
+                "output_rows": int(len(df)),
+                "rows_removed": rows_before - int(len(df)),
+                "duplicates_removed": duplicates_removed,
+                "null_values_before": nulls_before,
+                "null_values_after": int(df.isna().sum().sum()),
+                "output_file": _relative_output_path(self.root_dir, output_path),
+                "preview": _frame_preview(df),
+            }
+        except Exception as exc:
+            return {"status": "error", "error": str(exc)}
+
+    def get_tool(self) -> StructuredTool:
+        return StructuredTool.from_function(
+            func=self.clean_dataset,
+            name="clean_dataset",
+            description="Clean a dataset by trimming strings, removing duplicates, and filling missing values.",
+            args_schema=CleanDatasetInput,
+        )
+
+
+class CompareDatasetsTool:
+    def __init__(self, root_dir: Path):
+        self.root_dir = root_dir
+
+    def compare_datasets(
+        self,
+        baseline_file_path: str,
+        candidate_file_path: str,
+        key_columns: list[str] | None = None,
+    ) -> dict[str, Any]:
+        try:
+            baseline_path = resolve_workspace_path(self.root_dir, baseline_file_path, must_exist=True)
+            candidate_path = resolve_workspace_path(self.root_dir, candidate_file_path, must_exist=True)
+            baseline_df = _load_tabular_data(baseline_path)
+            candidate_df = _load_tabular_data(candidate_path)
+
+            baseline_columns = set(baseline_df.columns)
+            candidate_columns = set(candidate_df.columns)
+            common_columns = sorted(baseline_columns & candidate_columns)
+
+            dtype_changes = {
+                column: {
+                    "baseline": str(baseline_df[column].dtype),
+                    "candidate": str(candidate_df[column].dtype),
+                }
+                for column in common_columns
+                if str(baseline_df[column].dtype) != str(candidate_df[column].dtype)
+            }
+
+            numeric_drift: dict[str, Any] = {}
+            for column in common_columns:
+                if pd.api.types.is_numeric_dtype(baseline_df[column]) and pd.api.types.is_numeric_dtype(candidate_df[column]):
+                    base_mean = pd.to_numeric(baseline_df[column], errors="coerce").mean()
+                    cand_mean = pd.to_numeric(candidate_df[column], errors="coerce").mean()
+                    numeric_drift[column] = {
+                        "baseline_mean": _to_jsonable(round(base_mean, 4)) if pd.notna(base_mean) else None,
+                        "candidate_mean": _to_jsonable(round(cand_mean, 4)) if pd.notna(cand_mean) else None,
+                        "delta": _to_jsonable(round(cand_mean - base_mean, 4))
+                        if pd.notna(base_mean) and pd.notna(cand_mean)
+                        else None,
+                    }
+            numeric_drift = dict(list(numeric_drift.items())[:10])
+
+            key_overlap: dict[str, Any] | None = None
+            key_columns = key_columns or []
+            if key_columns:
+                missing_key_columns = [column for column in key_columns if column not in common_columns]
+                if missing_key_columns:
+                    return {
+                        "status": "error",
+                        "error": f"Key columns missing in one or both datasets: {', '.join(missing_key_columns)}",
+                    }
+
+                baseline_keys = baseline_df[key_columns].astype("string").fillna("<MISSING>").agg("||".join, axis=1)
+                candidate_keys = candidate_df[key_columns].astype("string").fillna("<MISSING>").agg("||".join, axis=1)
+                baseline_key_set = set(baseline_keys.tolist())
+                candidate_key_set = set(candidate_keys.tolist())
+                overlap = baseline_key_set & candidate_key_set
+                key_overlap = {
+                    "baseline_unique_keys": len(baseline_key_set),
+                    "candidate_unique_keys": len(candidate_key_set),
+                    "shared_unique_keys": len(overlap),
+                    "baseline_duplicate_keys": int(baseline_keys.duplicated().sum()),
+                    "candidate_duplicate_keys": int(candidate_keys.duplicated().sum()),
+                }
+
+            return {
+                "status": "success",
+                "shape": {
+                    "baseline_rows": int(len(baseline_df)),
+                    "candidate_rows": int(len(candidate_df)),
+                    "baseline_columns": int(len(baseline_df.columns)),
+                    "candidate_columns": int(len(candidate_df.columns)),
+                },
+                "columns_only_in_baseline": sorted(baseline_columns - candidate_columns),
+                "columns_only_in_candidate": sorted(candidate_columns - baseline_columns),
+                "dtype_changes": dtype_changes,
+                "numeric_drift": numeric_drift,
+                "key_overlap": key_overlap,
+            }
+        except Exception as exc:
+            return {"status": "error", "error": str(exc)}
+
+    def get_tool(self) -> StructuredTool:
+        return StructuredTool.from_function(
+            func=self.compare_datasets,
+            name="compare_datasets",
+            description="Compare two tabular datasets for schema differences, row overlap, and numeric drift.",
+            args_schema=CompareDatasetsInput,
+        )
+
+
+class SegmentDatasetTool:
+    def __init__(self, root_dir: Path):
+        self.root_dir = root_dir
+
+    def segment_dataset(
+        self,
+        input_file_path: str,
+        output_file_path: str,
+        feature_columns: list[str],
+        n_clusters: int = 3,
+        cluster_label_column: str = "cluster_label",
+        scale_features: bool = True,
+        random_state: int = 42,
+    ) -> dict[str, Any]:
+        try:
+            input_path = resolve_workspace_path(self.root_dir, input_file_path, must_exist=True)
+            output_path = resolve_workspace_path(self.root_dir, output_file_path, must_exist=False)
+            ensure_directory(output_path.parent)
+
+            df = _load_tabular_data(input_path).copy()
+            missing_columns = [column for column in feature_columns if column not in df.columns]
+            if missing_columns:
+                return {"status": "error", "error": f"Feature columns not found: {', '.join(missing_columns)}"}
+
+            feature_frame = df[feature_columns].apply(pd.to_numeric, errors="coerce")
+            if feature_frame.dropna(how="all").empty:
+                return {"status": "error", "error": "Selected feature columns do not contain usable numeric data."}
+
+            fill_values = feature_frame.median(numeric_only=True).fillna(0)
+            feature_frame = feature_frame.fillna(fill_values)
+            model_input = feature_frame.to_numpy()
+
+            if scale_features:
+                scaler = StandardScaler()
+                model_input = scaler.fit_transform(model_input)
+            else:
+                scaler = None
+
+            model = KMeans(n_clusters=n_clusters, random_state=random_state, n_init=10)
+            labels = model.fit_predict(model_input)
+
+            output_df = df.copy()
+            output_df[cluster_label_column] = labels
+            _write_tabular_data(output_df, output_path)
+
+            summary_path = output_path.with_name(f"{output_path.stem}_cluster_summary.csv")
+            summary_df = (
+                output_df.groupby(cluster_label_column)[feature_columns]
+                .agg(["count", "mean", "median"])
+                .round(4)
+            )
+            summary_df.to_csv(summary_path)
+
+            cluster_counts = pd.Series(labels).value_counts().sort_index()
+            warnings: list[str] = []
+            if not cluster_counts.empty and cluster_counts.min() <= max(2, int(0.05 * len(output_df))):
+                warnings.append("At least one cluster is very small; consider reducing the number of clusters.")
+
+            centroids = model.cluster_centers_
+            if scaler is not None:
+                centroids = scaler.inverse_transform(centroids)
+
+            return {
+                "status": "success",
+                "message": "Dataset segmented successfully.",
+                "output_file": _relative_output_path(self.root_dir, output_path),
+                "summary_file": _relative_output_path(self.root_dir, summary_path),
+                "feature_columns": feature_columns,
+                "n_clusters": n_clusters,
+                "cluster_counts": {str(index): int(value) for index, value in cluster_counts.items()},
+                "centroids": [
+                    {
+                        "cluster": int(cluster_id),
+                        **{
+                            column: _to_jsonable(round(value, 4))
+                            for column, value in zip(feature_columns, centroid)
+                        },
+                    }
+                    for cluster_id, centroid in enumerate(centroids)
+                ],
+                "warnings": warnings,
+                "preview": _frame_preview(output_df),
+            }
+        except Exception as exc:
+            return {"status": "error", "error": str(exc)}
+
+    def get_tool(self) -> StructuredTool:
+        return StructuredTool.from_function(
+            func=self.segment_dataset,
+            name="segment_dataset",
+            description="Cluster a dataset into segments using KMeans and export labeled output files.",
+            args_schema=SegmentDatasetInput,
+        )
+
+
+class ReportExportTool:
+    def __init__(self, root_dir: Path):
+        self.root_dir = root_dir
+
+    def export_report(
+        self,
+        output_file_path: str,
+        report_title: str,
+        executive_summary: str,
+        key_findings: list[str],
+        recommended_actions: list[str] | None = None,
+        supporting_metrics: dict[str, Any] | None = None,
+        source_file_paths: list[str] | None = None,
+        report_format: Literal["markdown", "json"] = "markdown",
+    ) -> dict[str, Any]:
+        try:
+            output_path = resolve_workspace_path(self.root_dir, output_file_path, must_exist=False)
+            ensure_directory(output_path.parent)
+
+            recommended_actions = recommended_actions or []
+            supporting_metrics = supporting_metrics or {}
+            source_file_paths = source_file_paths or []
+
+            if report_format == "json":
+                payload = {
+                    "title": report_title,
+                    "executive_summary": executive_summary,
+                    "key_findings": key_findings,
+                    "recommended_actions": recommended_actions,
+                    "supporting_metrics": supporting_metrics,
+                    "source_files": source_file_paths,
+                }
+                output_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+            else:
+                lines = [f"# {report_title}", "", "## Executive Summary", executive_summary, "", "## Key Findings"]
+                lines.extend(f"- {item}" for item in key_findings)
+
+                if recommended_actions:
+                    lines.extend(["", "## Recommended Actions"])
+                    lines.extend(f"- {item}" for item in recommended_actions)
+
+                if supporting_metrics:
+                    lines.extend(["", "## Supporting Metrics", "| Metric | Value |", "| --- | --- |"])
+                    for metric, value in supporting_metrics.items():
+                        lines.append(f"| {metric} | {_to_jsonable(value)} |")
+
+                if source_file_paths:
+                    lines.extend(["", "## Source Files"])
+                    lines.extend(f"- {path}" for path in source_file_paths)
+
+                output_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+
+            return {
+                "status": "success",
+                "message": "Report exported successfully.",
+                "output_file": _relative_output_path(self.root_dir, output_path),
+                "report_format": report_format,
+            }
+        except Exception as exc:
+            return {"status": "error", "error": str(exc)}
+
+    def get_tool(self) -> StructuredTool:
+        return StructuredTool.from_function(
+            func=self.export_report,
+            name="export_report",
+            description="Export a decision-ready markdown or JSON report to the workspace.",
+            args_schema=ReportExportInput,
+        )
+
 
 class CodePreprocessor:
     TARGET_FUNCTIONS = {
         "read_csv",
         "read_excel",
         "read_json",
-        "read_parquet",
-        "read_sql",
-        "read_html",
-        "read_xml",
-        "read_feather",
     }
 
     def __init__(self, root_dir_var: str = "ROOT_DIR"):
@@ -181,13 +674,25 @@ class CodePreprocessor:
             return ast.unparse(new_tree)
         except SyntaxError:
             return code
+
+
 _FILE_TYPE_MAP: dict[str, str] = {
-    ".png": "image", ".jpg": "image", ".jpeg": "image", ".gif": "image",
-    ".svg": "image", ".bmp": "image", ".webp": "image",
-    ".csv": "data", ".xlsx": "data", ".xls": "data", ".json": "data",
-    ".parquet": "data",
-    ".pdf": "document", ".docx": "document", ".pptx": "document",
-    ".txt": "document", ".md": "document",
+    ".png": "image",
+    ".jpg": "image",
+    ".jpeg": "image",
+    ".gif": "image",
+    ".svg": "image",
+    ".bmp": "image",
+    ".webp": "image",
+    ".csv": "data",
+    ".xlsx": "data",
+    ".xls": "data",
+    ".json": "data",
+    ".pdf": "document",
+    ".docx": "document",
+    ".pptx": "document",
+    ".txt": "document",
+    ".md": "document",
 }
 
 
@@ -199,7 +704,6 @@ def _classify_file(filename: str) -> tuple[str, str]:
 
 
 class SendFilesToUserTool:
-
     def __init__(
         self,
         root_dir: Path,
@@ -221,10 +725,7 @@ class SendFilesToUserTool:
         file_type, mime_type = _classify_file(resolved.name)
 
         if self.url_signer and self.user_id:
-            try:
-                relative_path = str(resolved.relative_to(self.root_dir))
-            except ValueError:
-                relative_path = resolved.name
+            relative_path = _relative_output_path(self.root_dir, resolved)
             secure_url = self.url_signer(relative_path)
         else:
             secure_url = f"/files/unknown/{filename}"
@@ -248,7 +749,7 @@ class SendFilesToUserTool:
             description=(
                 "Send a file from the workspace to the user. "
                 "Provide the filename relative to the workspace directory. "
-                "Use this for images, plots, CSV results, or any file the user needs."
+                "Use this for plots, reports, cleaned datasets, or comparison outputs."
             ),
             args_schema=SendFilesToUserInput,
             response_format="content_and_artifact",
@@ -302,6 +803,7 @@ class PlottingTool:
             exec_globals = {
                 "pd": pd,
                 "plt": plt,
+                "np": np,
                 "io": io,
                 "ROOT_DIR": self._root_prefix(),
                 "__builtins__": __builtins__,
@@ -323,7 +825,7 @@ class PlottingTool:
             return {
                 "status": "success",
                 "summary": summary,
-                "image_path": str(image_path) if image_path else None,
+                "image_path": _relative_output_path(self.root_dir, image_path) if image_path else None,
                 "error_output": stderr_content or None,
             }
         except Exception as exc:
@@ -352,403 +854,6 @@ class PlottingTool:
         )
 
 
-class MiningCompositingTool:
-    def __init__(self, root_dir: Path):
-        self.root_dir = root_dir
-
-    @staticmethod
-    def _load_data(path: Path) -> pd.DataFrame:
-        if path.suffix.lower() == ".csv":
-            return pd.read_csv(path)
-        return pd.read_excel(path)
-
-    @staticmethod
-    def _dentro_rango(val: float, rango: tuple[float, float]) -> bool:
-        return rango[0] <= val < rango[1]
-
-    def run_compositing(
-        self,
-        input_file_path: str,
-        output_file_path: str,
-        col_bhid: str,
-        col_from: str,
-        col_to: str,
-        col_grade: str,
-        cutoff_grade: float,
-        waste_cutoff: float,
-        max_waste_length: float,
-        priority_ranges: list[list[float]],
-        col_lithology: str | None = None,
-        exclude_lithology: str | None = None,
-    ) -> dict[str, Any]:
-        try:
-            input_path = resolve_workspace_path(self.root_dir, input_file_path, must_exist=True)
-            output_path = resolve_workspace_path(self.root_dir, output_file_path, must_exist=False)
-            ensure_directory(output_path.parent)
-
-            df = self._load_data(input_path)
-
-            internal_cols = {
-                col_bhid: "BHID",
-                col_from: "FROM",
-                col_to: "TO",
-                col_grade: "GRADE",
-            }
-            if col_lithology:
-                internal_cols[col_lithology] = "LITO"
-
-            for user_col in internal_cols.keys():
-                if user_col not in df.columns:
-                    return {"status": "error", "error": f"Column '{user_col}' not found in input."}
-
-            work_df = df.rename(columns=internal_cols).copy()
-            work_df["LENGTH"] = work_df["TO"] - work_df["FROM"]
-            work_df["GRADE"] = pd.to_numeric(work_df["GRADE"], errors="coerce").fillna(0)
-
-            ranges_tuples = [(r[0], r[1]) for r in priority_ranges]
-            compositos_finales: list[dict[str, Any]] = []
-
-            for sondaje_id, grupo in work_df.groupby("BHID"):
-                grupo = grupo.sort_values("FROM").reset_index(drop=True)
-
-                if col_lithology and exclude_lithology:
-                    idx_excluded = grupo.index[grupo["LITO"].astype(str).str.strip() == exclude_lithology]
-                    if len(idx_excluded) > 0:
-                        grupo = grupo.loc[idx_excluded.max() + 1 :].reset_index(drop=True)
-
-                if grupo.empty:
-                    continue
-
-                for i in range(len(grupo)):
-                    fila = grupo.iloc[i]
-
-                    if col_lithology and exclude_lithology:
-                        if str(fila.get("LITO", "")).strip() == exclude_lithology:
-                            continue
-
-                    ley_actual = fila["GRADE"]
-                    largo_actual = fila["LENGTH"]
-
-                    if ley_actual < cutoff_grade:
-                        continue
-
-                    inicio = fila["FROM"]
-                    fin = fila["TO"]
-                    acumulado_metal = ley_actual * largo_actual
-                    acumulado_largo = largo_actual
-
-                    izq = i - 1
-                    der = i + 1
-                    puentes_temporales: list[tuple[float, float, float, float]] = []
-
-                    while True:
-                        candidatos: list[tuple[str, int, float, float, float, float]] = []
-
-                        if izq >= 0:
-                            f = grupo.iloc[izq]
-                            valido = not (
-                                col_lithology
-                                and exclude_lithology
-                                and str(f.get("LITO", "")).strip() == exclude_lithology
-                            )
-                            if valido:
-                                candidatos.append(("izq", izq, f["GRADE"], f["LENGTH"], f["FROM"], f["TO"]))
-
-                        if der < len(grupo):
-                            f = grupo.iloc[der]
-                            valido = not (
-                                col_lithology
-                                and exclude_lithology
-                                and str(f.get("LITO", "")).strip() == exclude_lithology
-                            )
-                            if valido:
-                                candidatos.append(("der", der, f["GRADE"], f["LENGTH"], f["FROM"], f["TO"]))
-
-                        if not candidatos:
-                            break
-
-                        elegido: tuple[str, int, float, float, float, float] | None = None
-                        for r in ranges_tuples:
-                            filtrados = [c for c in candidatos if self._dentro_rango(c[2], r)]
-                            if filtrados:
-                                elegido = max(filtrados, key=lambda x: x[2])
-                                break
-
-                        if elegido is None:
-                            break
-
-                        lado, _, au_cand, largo_cand, desde_cand, hasta_cand = elegido
-
-                        if au_cand < waste_cutoff:
-                            puentes_temporales.append((au_cand * largo_cand, largo_cand, desde_cand, hasta_cand))
-                            if sum(p[1] for p in puentes_temporales) > max_waste_length:
-                                break
-                        else:
-                            metal_puente = sum(p[0] for p in puentes_temporales)
-                            largo_puente = sum(p[1] for p in puentes_temporales)
-                            nuevo_metal = acumulado_metal + metal_puente + (au_cand * largo_cand)
-                            nuevo_largo = acumulado_largo + largo_puente + largo_cand
-                            nueva_ley = nuevo_metal / nuevo_largo
-
-                            if nueva_ley >= cutoff_grade:
-                                acumulado_metal = nuevo_metal
-                                acumulado_largo = nuevo_largo
-                                min_start = min(inicio, desde_cand)
-                                if puentes_temporales:
-                                    min_start = min(min_start, min(p[2] for p in puentes_temporales))
-
-                                max_end = max(fin, hasta_cand)
-                                if puentes_temporales:
-                                    max_end = max(max_end, max(p[3] for p in puentes_temporales))
-
-                                inicio = min_start
-                                fin = max_end
-                                puentes_temporales = []
-                            else:
-                                break
-
-                        if lado == "izq":
-                            izq -= 1
-                        else:
-                            der += 1
-
-                    compositos_finales.append(
-                        {
-                            "BHID": sondaje_id,
-                            "FROM": inicio,
-                            "TO": fin,
-                            "LENGTH": acumulado_largo,
-                            "GRADE": round(acumulado_metal / acumulado_largo, 4),
-                        }
-                    )
-
-            if not compositos_finales:
-                return {
-                    "status": "warning",
-                    "message": "No composites generated with current parameters.",
-                    "output_file": None,
-                }
-
-            df_comp = pd.DataFrame(compositos_finales).sort_values(by=["BHID", "FROM"])
-            resultados_limpios = []
-            for _, corte in df_comp.iterrows():
-                if not resultados_limpios:
-                    resultados_limpios.append(corte)
-                    continue
-                ultimo = resultados_limpios[-1]
-
-                if corte["BHID"] == ultimo["BHID"]:
-                    if corte["FROM"] < ultimo["TO"]:
-                        largo_corte = corte["TO"] - corte["FROM"]
-                        largo_ultimo = ultimo["TO"] - ultimo["FROM"]
-                        if largo_corte > largo_ultimo:
-                            resultados_limpios[-1] = corte
-                    else:
-                        resultados_limpios.append(corte)
-                else:
-                    resultados_limpios.append(corte)
-
-            df_final = pd.DataFrame(resultados_limpios).rename(
-                columns={
-                    "BHID": col_bhid,
-                    "FROM": "COMP_FROM",
-                    "TO": "COMP_TO",
-                    "LENGTH": "COMP_LENGTH",
-                    "GRADE": f"COMP_{col_grade}",
-                }
-            )
-
-            df_final.to_csv(output_path, index=False)
-            try:
-                output_ref = str(output_path.relative_to(self.root_dir))
-            except ValueError:
-                output_ref = str(output_path)
-
-            return {
-                "status": "success",
-                "message": f"Compositing completed. {len(df_final)} intervals generated.",
-                "output_file": output_ref,
-                "preview": df_final.head(5).to_dict(),
-            }
-        except Exception as exc:
-            return {"status": "error", "error": str(exc)}
-
-    def get_tool(self) -> StructuredTool:
-        return StructuredTool.from_function(
-            func=self.run_compositing,
-            name="run_mining_compositing",
-            description="Run mining compositing and output CSV path.",
-            args_schema=CompositingInput,
-        )
-class NearestNeighborAssignmentTool:
-    """Tool para asignar atributos del origen al destino usando KDTree (vecino más cercano)."""
-
-    def __init__(self, root_dir: Path):
-        self.root_dir = root_dir
-
-    @staticmethod
-    def _load_data(path: Path) -> pd.DataFrame:
-        if path.suffix.lower() == ".csv":
-            return pd.read_csv(path, encoding="utf-8")
-        return pd.read_excel(path)
-
-    def run_nearest_neighbor(
-        self,
-        origin_file_path: str,
-        destination_file_path: str,
-        output_file_path: str,
-        radius: float,
-        col_x: str = "X",
-        col_y: str = "Y",
-        col_z: str = "Z",
-    ) -> dict[str, Any]:
-        """
-        Asigna atributos del archivo origen al archivo destino basándose en el
-        vecino más cercano (KDTree) dentro de un radio especificado.
-
-        Args:
-            origin_file_path: Ruta al CSV/Excel de origen (puntos con atributos a transferir).
-            destination_file_path: Ruta al CSV/Excel de destino (puntos que recibirán atributos).
-            output_file_path: Ruta del CSV de salida con los atributos asignados.
-            radius: Radio máximo de búsqueda para la asignación.
-            col_x: Nombre de la columna X en ambos archivos.
-            col_y: Nombre de la columna Y en ambos archivos.
-            col_z: Nombre de la columna Z en ambos archivos.
-        """
-        try:
-            origin_path = resolve_workspace_path(self.root_dir, origin_file_path, must_exist=True)
-            dest_path = resolve_workspace_path(self.root_dir, destination_file_path, must_exist=True)
-            output_path = resolve_workspace_path(self.root_dir, output_file_path, must_exist=False)
-            ensure_directory(output_path.parent)
-
-            # --- Carga y normalización ---
-            df_origin = self._load_data(origin_path)
-            df_origin.columns = [c.upper() for c in df_origin.columns]
-
-            df_dest = self._load_data(dest_path)
-            df_dest.columns = [c.upper() for c in df_dest.columns]
-
-            coord_cols = [col_x.upper(), col_y.upper(), col_z.upper()]
-
-            # --- Validación de columnas requeridas ---
-            for col in coord_cols:
-                if col not in df_origin.columns:
-                    return {"status": "error", "error": f"Column '{col}' not found in origin file."}
-                if col not in df_dest.columns:
-                    return {"status": "error", "error": f"Column '{col}' not found in destination file."}
-
-            # --- Forzar numérico y filtrar filas válidas ---
-            for col in coord_cols:
-                df_origin[col] = pd.to_numeric(df_origin[col], errors="coerce")
-                df_dest[col] = pd.to_numeric(df_dest[col], errors="coerce")
-
-            origin_valid_mask = df_origin[coord_cols].notna().all(axis=1)
-            dest_valid_mask = df_dest[coord_cols].notna().all(axis=1)
-
-            df_origin_valid = df_origin.loc[origin_valid_mask].reset_index(drop=True)
-            df_dest_out = df_dest.copy()
-
-            if len(df_origin_valid) == 0:
-                df_dest_out.to_csv(output_path, index=False)
-                return {
-                    "status": "warning",
-                    "message": "Origin file has no valid rows with numeric X, Y, Z. Output generated without assignments.",
-                    "output_file": str(output_path.relative_to(self.root_dir)),
-                }
-
-            if int(dest_valid_mask.sum()) == 0:
-                df_dest_out.to_csv(output_path, index=False)
-                return {
-                    "status": "warning",
-                    "message": "Destination file has no valid rows with numeric X, Y, Z. Output generated without assignments.",
-                    "output_file": str(output_path.relative_to(self.root_dir)),
-                }
-
-            # --- KDTree ---
-            origin_coords = df_origin_valid[coord_cols].values
-            dest_coords = df_dest_out.loc[dest_valid_mask, coord_cols].values
-            tree = KDTree(origin_coords, leaf_size=2)
-
-            # --- Preparar columnas de atributos a transferir ---
-            attribute_cols = [c for c in df_origin_valid.columns if c not in coord_cols]
-
-            col_mapping: list[tuple[str, str]] = []  # (origen_col, destino_col)
-            for col in attribute_cols:
-                col_out = col
-                if col in df_dest_out.columns:
-                    col_out = f"{col}_2"
-                if pd.api.types.is_numeric_dtype(df_origin_valid[col]):
-                    df_dest_out[col_out] = np.nan
-                else:
-                    df_dest_out[col_out] = pd.Series(dtype="object")
-                col_mapping.append((col, col_out))
-
-            df_dest_out["YP_DISTANCIA"] = np.nan
-
-            # --- Consulta KDTree: vecino más cercano ---
-            distances, indices = tree.query(dest_coords, k=1, return_distance=True)
-            distances = distances.flatten()
-            indices = indices.flatten()
-
-            valid_dest_indices = df_dest_out.index[dest_valid_mask].to_numpy()
-
-            match_count = 0
-            for i, dest_idx in enumerate(valid_dest_indices):
-                dist = distances[i]
-                origin_idx = indices[i]
-
-                if dist <= radius:
-                    for col_o, col_d in col_mapping:
-                        df_dest_out.loc[dest_idx, col_d] = df_origin_valid.loc[origin_idx, col_o]
-                    df_dest_out.loc[dest_idx, "YP_DISTANCIA"] = dist
-                    match_count += 1
-
-            # --- Exportar ---
-            df_dest_out.to_csv(output_path, index=False)
-
-            try:
-                output_ref = str(output_path.relative_to(self.root_dir))
-            except ValueError:
-                output_ref = str(output_path)
-
-            total_dest_valid = int(dest_valid_mask.sum())
-            unmatched = total_dest_valid - match_count
-
-            return {
-                "status": "success",
-                "message": (
-                    f"Nearest neighbor assignment completed. "
-                    f"{match_count} matches found within radius {radius}. "
-                    f"{unmatched} destination points had no neighbor within radius. "
-                    f"{len(attribute_cols)} attribute(s) transferred from origin."
-                ),
-                "output_file": output_ref,
-                "summary": {
-                    "origin_valid_points": len(df_origin_valid),
-                    "destination_valid_points": total_dest_valid,
-                    "matches_within_radius": match_count,
-                    "unmatched_points": unmatched,
-                    "attributes_transferred": attribute_cols,
-                    "radius": radius,
-                },
-                "preview": df_dest_out.head(5).to_dict(),
-            }
-
-        except Exception as exc:
-            return {"status": "error", "error": str(exc)}
-
-    def get_tool(self) -> StructuredTool:
-        return StructuredTool.from_function(
-            func=self.run_nearest_neighbor,
-            name="run_nearest_neighbor_assignment",
-            description=(
-                "Assign attributes from an origin point dataset to the nearest neighbor "
-                "in a destination dataset using a KDTree spatial search within a given radius. "
-                "Requires origin CSV, destination CSV, output path, and search radius."
-            ),
-            args_schema=NearestNeighborInput,
-        )
-
 def build_tool_registry(
     root_dir: Path,
     *,
@@ -757,21 +862,26 @@ def build_tool_registry(
 ) -> dict[str, Any]:
     preview_tool = DatasetPreviewTool(root_dir=root_dir).get_tool()
     validate_tool = DatasetValidateTool(root_dir=root_dir).get_tool()
+    profile_tool = DatasetProfileTool(root_dir=root_dir).get_tool()
+    clean_tool = CleanDatasetTool(root_dir=root_dir).get_tool()
+    compare_tool = CompareDatasetsTool(root_dir=root_dir).get_tool()
+    segment_tool = SegmentDatasetTool(root_dir=root_dir).get_tool()
+    report_tool = ReportExportTool(root_dir=root_dir).get_tool()
     plotting_tool = PlottingTool(root_dir=root_dir).get_tool()
-    compositing_tool = MiningCompositingTool(root_dir=root_dir).get_tool()
     send_files_tool = SendFilesToUserTool(
         root_dir=root_dir,
         user_id=user_id,
         url_signer=url_signer,
     ).get_tool()
-    nearest_neighbor_tool = NearestNeighborAssignmentTool(root_dir=root_dir).get_tool()
 
     return {
         "preview_dataset": preview_tool,
         "validate_dataset": validate_tool,
+        "profile_dataset": profile_tool,
+        "clean_dataset": clean_tool,
+        "compare_datasets": compare_tool,
+        "segment_dataset": segment_tool,
+        "export_report": report_tool,
         "generate_plot": plotting_tool,
-        "run_mining_compositing": compositing_tool,
         "send_files_to_user": send_files_tool,
-        "run_nearest_neighbor_assignment": nearest_neighbor_tool,
     }
-

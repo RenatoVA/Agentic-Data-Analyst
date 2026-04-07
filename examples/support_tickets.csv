@@ -1,0 +1,13 @@
+ticket_id,team,priority,category,open_hours,csat_score,first_response_minutes,resolved
+T-001,Platform,High,Bug,12,4.2,18,yes
+T-002,Data,Medium,HowTo,36,3.8,44,yes
+T-003,Platform,Critical,Outage,4,4.7,6,yes
+T-004,Security,High,Access,20,4.1,21,yes
+T-005,Data,Low,Request,52,3.4,75,no
+T-006,Platform,Medium,Bug,28,3.9,39,yes
+T-007,Security,Critical,Incident,8,4.6,9,yes
+T-008,Data,High,Bug,40,3.2,65,no
+T-009,Platform,Low,HowTo,16,4.5,14,yes
+T-010,Security,Medium,Access,24,4.0,27,yes
+T-011,Data,Medium,Request,33,3.7,48,no
+T-012,Platform,High,Bug,18,4.3,19,yes

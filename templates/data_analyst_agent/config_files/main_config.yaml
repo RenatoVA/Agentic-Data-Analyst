@@ -1,0 +1,17 @@
+name: Data_Analyst_Main_Agent
+system_prompt_key: MAIN_PROMPT
+workspace_path: workspace
+tools:
+  - preview_dataset
+  - validate_dataset
+  - profile_dataset
+  - compare_datasets
+  - export_report
+  - send_files_to_user
+interrupt_on:
+  - export_report
+prompts:
+  MAIN_PROMPT: main_prompt.md
+  PROMPT_DATA_QUALITY: prompt_data_quality.md
+  PROMPT_VISUALIZATION: prompt_visualization.md
+  PROMPT_SEGMENTATION: prompt_segmentation.md

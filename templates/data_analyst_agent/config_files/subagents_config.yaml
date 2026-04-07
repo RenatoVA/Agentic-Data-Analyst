@@ -1,0 +1,34 @@
+subagents:
+  - name: Data_Quality_Subagent
+    description: Specialist for schema validation, dataset profiling, cleaning plans, and comparing dataset versions.
+    system_prompt_key: PROMPT_DATA_QUALITY
+    tools:
+      - preview_dataset
+      - validate_dataset
+      - profile_dataset
+      - clean_dataset
+      - compare_datasets
+      - export_report
+    interrupt_on:
+      - clean_dataset
+      - export_report
+
+  - name: Visualization_Subagent
+    description: Specialist for analytical plotting, chart interpretation, and artifact recommendations.
+    system_prompt_key: PROMPT_VISUALIZATION
+    tools:
+      - preview_dataset
+      - profile_dataset
+      - generate_plot
+
+  - name: Segmentation_Subagent
+    description: Specialist for clustering, cohort segmentation, and turning numeric features into actionable segments.
+    system_prompt_key: PROMPT_SEGMENTATION
+    tools:
+      - preview_dataset
+      - profile_dataset
+      - segment_dataset
+      - generate_plot
+      - export_report
+    interrupt_on:
+      - export_report

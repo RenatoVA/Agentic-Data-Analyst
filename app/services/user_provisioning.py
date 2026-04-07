@@ -11,7 +11,7 @@ from app.core.config import Settings
 from app.core.errors import ConfigValidationError, UserRegistrationError
 from app.utils.files import ensure_directory
 
-DEFAULT_AGENT_NAME = "geology_agent"
+DEFAULT_AGENT_NAME = "data_analyst_agent"
 USER_ID_PATTERN = re.compile(r"^[a-z0-9_-]+$")
 
 
@@ -72,6 +72,7 @@ class UserProvisioningService:
         template_agent_dir = self.templates_dir / DEFAULT_AGENT_NAME
         config_templates_dir = template_agent_dir / "config_files"
         prompts_templates_dir = template_agent_dir / "prompts"
+        workspace_templates_dir = template_agent_dir / "workspace_seed"
         user_agent_dir = user_dir / "agents" / DEFAULT_AGENT_NAME
         user_prompts_dir = user_agent_dir / "prompts"
 
@@ -82,7 +83,7 @@ class UserProvisioningService:
         template_sub = config_templates_dir / "subagents_config.yaml"
         if not template_main.is_file() or not template_sub.is_file():
             raise UserRegistrationError(
-                f"Missing geology_agent templates in {config_templates_dir}."
+                f"Missing data_analyst_agent templates in {config_templates_dir}."
             )
 
         self._write_main_config(
@@ -103,6 +104,8 @@ class UserProvisioningService:
             if not target_prompt.exists():
                 target_prompt.write_text(prompt_file.read_text(encoding="utf-8"), encoding="utf-8")
 
+        self._seed_workspace_templates(source_dir=workspace_templates_dir, workspace_dir=workspace_dir)
+
     def _write_main_config(self, *, template_main: Path, target_main: Path, workspace_dir: Path) -> None:
         template_cfg = self._load_yaml_object(template_main, "template main_config.yaml")
         template_cfg["workspace_path"] = str(workspace_dir.resolve())
@@ -120,6 +123,19 @@ class UserProvisioningService:
             yaml.safe_dump(template_cfg, sort_keys=False, allow_unicode=False),
             encoding="utf-8",
         )
+
+    def _seed_workspace_templates(self, *, source_dir: Path, workspace_dir: Path) -> None:
+        if not source_dir.is_dir():
+            return
+
+        for source_path in source_dir.rglob("*"):
+            if source_path.is_dir():
+                continue
+            relative_path = source_path.relative_to(source_dir)
+            target_path = workspace_dir / relative_path
+            ensure_directory(target_path.parent)
+            if not target_path.exists():
+                target_path.write_bytes(source_path.read_bytes())
 
     @staticmethod
     def _load_yaml_object(path: Path, label: str) -> dict[str, Any]:
